@@ -1,0 +1,17 @@
+Title Transmogrify
+Version 
+Description Folder action for transcoding movies for iPod, iTunes and Apple TV.
+DefaultLocation /Library/
+DeleteWarning 
+
+### Package Flags
+
+NeedsAuthorization YES
+Required NO
+Relocatable NO
+RequiresReboot NO
+UseUserMask NO
+OverwritePermissions NO
+InstallFat NO
+RootVolumeOnly YES
+OnlyUpdateInstalledLanguages NO

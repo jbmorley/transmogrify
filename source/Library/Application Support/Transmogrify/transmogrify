@@ -1,0 +1,280 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Data::Dumper;
+use File::Find;
+use Pod::Usage;
+use Getopt::Long;
+
+# Globals.
+my $types = ["mov", "wmv", "avi", "mpg", "mkv"];
+
+# Parameters.
+my $param_help;
+my $param_format;
+my $param_helplong;
+
+# Process Parameters.
+GetOptions(
+            "h" => \$param_help,
+            "help" => \$param_helplong,
+            );
+my @input = @ARGV;
+
+# Global Variables.
+our @files = ();
+
+
+# Display Help.
+if ($param_help || $param_helplong) { pod2usage(-verbose => 1); }
+
+# Do Stuff.
+Run(@input);
+exit;
+
+
+sub Run {
+    my (@input) = @_;
+
+    foreach my $file (@input) {
+        chomp $file;
+        if (-d $file) { find(\&Wanted, $file); }
+        elsif (Matches($file)) { push(@files, $file); }
+    }
+    
+    my @converters = ();
+    
+    foreach my $file (@files) {
+        my $converter = new Converter($file);
+        push(@converters, $converter);
+    }
+    
+    foreach my $converter (@converters) {
+        if ($converter->Convert) {
+            $converter->TidyUp;
+        }
+    }
+
+}
+
+sub Wanted {
+    if (Matches($File::Find::name)) {
+        push(@files, $File::Find::name);
+    }
+}
+
+sub Matches {
+    my ($file) = @_;
+    foreach my $type (@$types) {
+        if ($file =~ /$type$/ && $file !~ /\.transmogrify\//) {
+            return 1;
+        }    
+    }
+    return 0;
+}
+
+=head1 NAME
+
+transmogrify - Encode movies for iTunes
+
+=head1 SYNOPSIS
+
+transmogrify [options] <file1> [<file2>]
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--help>
+
+Print a brief help message and exit.
+
+=item B<-h>
+
+Print a brief help message and exit.
+
+=back
+
+=head1 DESCRIPTION
+
+B<This program> will read the given input file(s) and do something
+useful with the contents thereof.
+
+=cut
+
+package Converter;
+
+use File::Copy;
+use FindBin;
+use IO::Handle;
+
+sub new {
+    my ($package, $filename) = @_;
+    my $self = {};
+    bless($self, $package);
+
+    $self->{filename} = $filename;
+    $self->{level_current} = -1;
+    
+    if ($filename =~ /^(.*?)([^\/]+)(\.[^\.]+)$/) {
+        $self->{filename_path}    = $1;
+        if (!defined($self->{filename_path}) || $self->{filename_path} eq "") {
+            $self->{filename_path} = "./";
+        }
+        $self->{filename_name}     = $2;
+        $self->{filename_ext}      = $3;
+
+        $self->{pending_path}      = $self->{filename_path}.$self->{filename_name}.".transmogrify";
+        $self->{pending_original}  = $self->{pending_path}."/".$self->{filename_name}.$self->{filename_ext};
+        $self->{pending_new}       = $self->{pending_path}."/".$self->{filename_name}.".mp4";
+        
+        $self->{ffmpeg}            = $FindBin::Bin."/ffmpeg";
+        $self->{setfile}           = $FindBin::Bin."/setfile";
+        
+        $self->{ffmpeg} =~ s/\s/\\ /g;
+                
+        $self->{pending_icon}     = $self->{pending_path}."/"."Icon".chr(13);
+    }
+    
+    # Create the pending directory and move the source file in.
+    mkdir($self->{pending_path}) or die "Unable to create pending directory, $!";
+    move($self->{filename}, $self->{pending_original});
+    
+    $self->_SetLevel(0);
+    $self->_GetInfo();
+
+    return $self;
+}
+    
+
+sub _GetInfo {
+    my ($self) = @_;
+        
+    my $info = {};    
+    
+    my $file = $self->{pending_original};
+    $file =~ s/"/\\"/g;
+    my $command = $self->{ffmpeg}." -i \"".$file."\" 2>&1 |";
+
+    open(IN, $command);
+    foreach my $line (<IN>) {
+        chomp $line;
+        
+        $self->Log($line);
+        
+        if ($line =~ /^Duration-(\d+)/) {
+            $info->{duration} = $1;
+        }
+        
+        my @split = split(/,/, $line);
+        if (scalar(@split) > 5) {
+            if ($split[5] eq "Video") {
+                $info->{width} = $split[8];
+                $info->{height} = $split[9];
+                $info->{framerate} = $split[10];
+            } elsif ($split[5] eq "Audio") {
+            
+            }
+        }
+    }
+    
+    $info->{frames} = int( $info->{framerate} * $info->{duration} );
+    $self->{info} = $info;
+}
+    
+sub Convert {
+    my ($self) = @_;
+    
+    my $file = $self->{pending_original};
+    $file =~ s/"/\\"/g;
+    my $file_new = $self->{pending_new};
+    $file_new =~ s/"/\\"/g;
+    
+    my ($target_width, $target_height) = (640, 480);
+    my $target_ratio = $target_width / $target_height;
+    my $ratio = $self->{info}->{height}/$self->{info}->{width};
+    
+    my ($actual_width, $actual_height);
+
+    if ($self->{info}->{height}<=$target_height && $self->{info}->{width}<=$target_width) {
+        $actual_width = $self->{info}->{width};
+        $actual_height = $self->{info}->{height};
+    } elsif ($ratio >= $target_ratio) {
+        $actual_height = $target_height;
+        $actual_width = $target_height / $ratio;
+    } else {
+        $actual_width = $target_width;
+        $actual_height = $ratio * $target_width;
+    }
+
+    # Ensure that the values are ints.
+    $actual_width = int($actual_width);
+    $actual_height = int($actual_height);
+    
+    # Snap the new dimensions to multiples of 16 for better h264 compression.
+    my $multiple = $actual_width / 16; $actual_width = int($multiple) * 16;
+    $multiple = $actual_height / 16; $actual_height = int($multiple) * 16;
+    
+    # Correct some strange behaviour which mandates that the framesize is even.
+    if (($actual_height % 2) != 0) { $actual_height--; }
+    if (($actual_width % 2) != 0) { $actual_width--; }
+    
+    my $command = $self->{ffmpeg}." -y -i \"".$file."\" -threads 4 -s ".$actual_width."x".$actual_height." -aspect ".$actual_width.":".$actual_height." -r ".$self->{info}->{framerate}." -vcodec h264 -g 200 -qmin 23 -b 1200k -level 30 -loop 1 -sc_threshold 40 -partp4x4 1 -rc_eq 'blurCplx^(1-qComp)' -refs 2 -qmax 51 -maxrate 1500k -bufsize 500k -async 50 -acodec aac -ar 48000 -ac 2 -ab 128k \"".$file_new."\"";
+    
+    $self->Log($command);
+    
+    open(FFMPEG, $command." 2>&1 |") or die "Unable to run ffmpeg, $!";
+    my $buffer = ""; my $ongoing = "";
+    while (sysread(FFMPEG, $buffer, 8)) {
+        $ongoing .= $buffer;
+        if ($ongoing =~ /frame=\s+(\d+)\s+/) {
+            $self->{frame_current} = $1;
+            my $level = int( ( $self->{frame_current} / $self->{info}->{frames} ) * 5 );
+            $self->_SetLevel($level);
+            $ongoing = "";
+        }
+    }
+    close(FFMPEG);
+    $self->_SetLevel(10);
+    
+    # TODO Fix at some point.
+    return 1;
+    
+    if ($self->{frame_current} > ($self->{info}->{frames}-10)) {
+        return 1;
+    }
+    return 0;
+}
+
+sub TidyUp {
+    my ($self) = @_;
+
+    move($self->{pending_new}, $self->{filename_path}) or die "Unable to move completed file, $!";
+    unlink($self->{pending_icon});
+    unlink($self->{pending_original});
+    rmdir($self->{pending_path});
+}
+
+sub _SetLevel {
+    my ($self, $level) = @_;
+    my $folder = $self->{pending_path};
+    
+    if ($self->{level_current} != $level) {
+        $self->{level_current} = $level;
+
+        my $icon = $FindBin::Bin."/Icons/convert".$level.".icns";
+        my $setcustomicon = $FindBin::Bin."/Transmogrify.app/Contents/Resources/SetCustomIcon";
+        
+        system($setcustomicon, $icon, $folder);
+    }
+}
+
+sub Log {
+    my ($self, $line) = @_;
+    open(CONSOLE, "> /dev/console") or die "Unable to open /dev/console, $!";
+    print CONSOLE "[transmogrify] ".$line."\n";
+    close(CONSOLE);
+}
+ 
+1;
